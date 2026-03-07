@@ -3,8 +3,10 @@
 //
 //  环境变量（wrangler secret put）：
 //    ADMIN_PASSWORD  — 登录密码（必须）
-//    CF_ACCOUNT_ID   — 额度查询用（可选）
-//    CF_API_TOKEN    — 额度查询用，需 Workers AI Read 权限（可选）
+//
+//  KV 绑定（wrangler.toml）：
+//    [[kv_namespaces]]
+//    binding = "AI_JOBS"   ← 对话历史云端持久化
 //
 //  Routes:
 //    GET  /               → HTML 页面
@@ -12,7 +14,9 @@
 //    POST /               → 流式聊天        [需鉴权]
 //    POST /api/vision     → 图片理解        [需鉴权]
 //    POST /api/translate  → 翻译            [需鉴权]
-//    GET  /api/usage      → 真实额度查询    [需鉴权]
+//    GET  /api/history    → 读取云端历史    [需鉴权]
+//    POST /api/history    → 保存云端历史    [需鉴权]
+//    GET  /api/models     → 模型列表（KV 缓存）[需鉴权]
 // ============================================================
 
 // ── Token 签名（无状态，每日轮换） ──────────────────────────
@@ -50,7 +54,8 @@ async function requireAuth(request, env) {
 
 // ── Route handler ─────────────────────────────────────────
 export default {
-  async fetch(request, env) {
+  // ctx 参数让 ctx.waitUntil() 可在客户端断开后继续在 CF 后台执行
+  async fetch(request, env, ctx) {
     const url    = new URL(request.url);
     const method = request.method;
 
@@ -68,11 +73,12 @@ export default {
     const authErr = await requireAuth(request, env);
     if (authErr) return authErr;
 
-    if (method === "POST" && url.pathname === "/")              return handleChat(request, env);
+    if (method === "POST" && url.pathname === "/")               return handleChatSubmit(request, env);
     if (method === "POST" && url.pathname === "/api/vision")    return handleVision(request, env);
     if (method === "POST" && url.pathname === "/api/translate") return handleTranslate(request, env);
     if (method === "GET"  && url.pathname === "/api/models")    return handleModels(request, env);
-    if (method === "GET"  && url.pathname === "/api/usage")     return handleUsage(request, env);
+    if (method === "GET"  && url.pathname === "/api/history")   return handleHistoryGet(request, env);
+    if (method === "POST" && url.pathname === "/api/history")   return handleHistoryPost(request, env);
 
     return new Response("Not Found", { status: 404 });
   },
@@ -92,42 +98,47 @@ async function handleLogin(request, env) {
   return Response.json({ token });
 }
 
-// ── /api/chat (POST /) ─────────────────────────────────────
-async function handleChat(request, env) {
-  const { messages, model, system } = await request.json();
+// ── POST / → 直接 SSE 流式响应（最可靠方案）────────────────
+// 放弃 KV 轮询：ctx.waitUntil 有 30s 墙钟限制，AI 推理超时后 KV 永远停在 running
+// SSE 直接流式返回，前端实时显示 token，无需轮询
+async function handleChatSubmit(request, env, ctx) {
+  const body = await request.json();
+  const { messages, model, system, max_tokens } = body;
   if (!messages || !messages.length) {
     return Response.json({ error: "messages 不能为空" }, { status: 400 });
   }
-  const params = {
-    messages,
-    stream: true,
-    max_tokens: 2048,
-  };
-  // 作为顶层参数传入，而非 role:"system" 消息（大多数模型不支持后者）
+
+  const mdl    = model || "@cf/zai-org/glm-4.7-flash";
+  const maxTok = Math.min(32768, Math.max(256, Number(max_tokens) || 8192));
+  const params = { messages, stream: true, max_tokens: maxTok };
   if (system) params.system = system;
+
   try {
-    const stream = await env.AI.run(model || "@cf/zai-org/glm-4.7-flash", params);
+    const stream = await env.AI.run(mdl, params);
     return new Response(stream, {
       headers: {
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
       },
     });
   } catch (e) {
-    // 若带 system 失败，去掉 system 重试（部分模型不支持该参数）
+    // 部分模型不支持 system，去掉重试
     if (system) {
-      delete params.system;
-      const stream2 = await env.AI.run(model || "@cf/zai-org/glm-4.7-flash", params);
-      return new Response(stream2, {
-        headers: {
-          "Content-Type": "text/event-stream",
-          "Cache-Control": "no-cache",
-        },
-      });
+      try {
+        delete params.system;
+        const s2 = await env.AI.run(mdl, params);
+        return new Response(s2, {
+          headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" },
+        });
+      } catch (e2) {
+        return Response.json({ error: e2.message }, { status: 500 });
+      }
     }
     return Response.json({ error: e.message }, { status: 500 });
   }
 }
+
 
 // ── /api/vision ───────────────────────────────────────────
 async function handleVision(request, env) {
@@ -213,6 +224,18 @@ const TASK_GROUP = {
 };
 
 async function handleModels(request, env) {
+  // 先查 KV 缓存（30 分钟）
+  if (env.AI_JOBS) {
+    try {
+      const cached = await env.AI_JOBS.get("models_cache");
+      if (cached) {
+        const { data, ts } = JSON.parse(cached);
+        if (Date.now() - ts < 30 * 60 * 1000) {
+          return Response.json(data);
+        }
+      }
+    } catch {}
+  }
   try {
     const res = await fetch('https://developers.cloudflare.com/workers-ai/models/index.md', {
       headers: {'User-Agent':'CF-AI-Chat/1.0'},
@@ -283,54 +306,46 @@ async function handleModels(request, env) {
       models.push({ id:modelId, name, slug, desc, group, task:taskKey, tags });
     }
 
-    return Response.json({ ok:true, models, count:models.length,
+    const result = { ok:true, models, count:models.length,
       byTask: Object.fromEntries(
         Object.entries(TASK_GROUP).map(([k,v])=>[k, models.filter(m=>m.task===k).length])
       )
-    });
+    };
+    // 写入 KV 缓存
+    if (env.AI_JOBS) {
+      env.AI_JOBS.put("models_cache", JSON.stringify({ data: result, ts: Date.now() }),
+        { expirationTtl: 3600 }).catch(() => {});
+    }
+    return Response.json(result);
   } catch(e) {
     return Response.json({ error:e.message, ok:false });
   }
 }
 
-// ── /api/usage ────────────────────────────────────────────
-async function handleUsage(request, env) {
-  const accountId = env.CF_ACCOUNT_ID;
-  const apiToken  = env.CF_API_TOKEN;
-  if (!accountId || !apiToken) {
-    return Response.json({ error: "未配置 CF_ACCOUNT_ID 或 CF_API_TOKEN", configured: false });
-  }
+// ── /api/history GET/POST：KV 云端对话历史 ──────────────────
+// KV binding: AI_JOBS（binding = "AI_JOBS" in wrangler.toml）
+// Key: "history"，存储完整 chatHistory JSON 数组
+
+async function handleHistoryGet(request, env) {
+  if (!env.AI_JOBS) return Response.json({ history: [], kv: false });
   try {
-    const now   = new Date();
-    const dateStr = now.toISOString().slice(0, 10);
-    // 使用 GraphQL Analytics API 查询 Workers AI 用量
-    const query = `{
-      viewer {
-        accounts(filter: { accountTag: "${accountId}" }) {
-          workersAIInferenceRequests: workersInvocationsAdaptive(
-            filter: { datetimeHour_geq: "${dateStr}T00:00:00Z", datetimeHour_leq: "${now.toISOString()}" }
-            limit: 1
-          ) {
-            sum { requests }
-          }
-        }
-      }
-    }`;
-    const gqlRes = await fetch("https://api.cloudflare.com/client/v4/graphql", {
-      method: "POST",
-      headers: { "Authorization": `Bearer ${apiToken}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ query }),
-    });
-    // 同时也尝试 REST 端点
-    const restRes = await fetch(
-      `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/run/@cf/meta/llama-3.1-8b-instruct`,
-      { method: "HEAD", headers: { "Authorization": `Bearer ${apiToken}` } }
-    ).catch(() => null);
-    const gqlData = await gqlRes.json().catch(() => null);
-    // 返回原始数据，前端自行处理
-    return Response.json({ configured: true, usage: { neurons_used: 0, requests: 0 }, gql: gqlData, note: "usage API 已迁移，数据仅供参考" });
+    const raw = await env.AI_JOBS.get("history");
+    const history = raw ? JSON.parse(raw) : [];
+    return Response.json({ history, kv: true });
   } catch (e) {
-    return Response.json({ error: e.message, configured: true });
+    return Response.json({ history: [], error: e.message });
+  }
+}
+
+async function handleHistoryPost(request, env) {
+  if (!env.AI_JOBS) return Response.json({ ok: false, kv: false });
+  try {
+    const { history } = await request.json();
+    if (!Array.isArray(history)) return Response.json({ ok: false, error: "invalid" }, { status: 400 });
+    await env.AI_JOBS.put("history", JSON.stringify(history), { expirationTtl: 60 * 60 * 24 * 30 }); // 30 天
+    return Response.json({ ok: true });
+  } catch (e) {
+    return Response.json({ ok: false, error: e.message });
   }
 }
 
@@ -477,42 +492,52 @@ function getHTML() {
     .tag-batch {color:#56b6c2;border-color:#56b6c233;background:#56b6c211;}
     .tag-lora    {color:#c678dd;border-color:#c678dd33;background:#c678dd11;}
     .tag-partner {color:#98c379;border-color:#98c37933;background:#98c37911;}
+    .thinking-dots{display:inline-flex;gap:4px;align-items:center;padding:4px 0;}
+    .thinking-dots span{width:6px;height:6px;border-radius:50%;background:var(--accent2);
+      animation:dot-blink 1.2s ease-in-out infinite;}
+    .thinking-dots span:nth-child(2){animation-delay:.2s;}
+    .thinking-dots span:nth-child(3){animation-delay:.4s;}
+    @keyframes dot-blink{0%,80%,100%{opacity:.2}40%{opacity:1}}
+    .job-status{color:var(--muted);font-size:12px;display:inline-flex;align-items:center;}
+    .spin-icon{animation:spin .9s linear infinite;}
     .tag-realtime{color:#61afef;border-color:#61afef33;background:#61afef11;}
     .model-item-nonchat{opacity:.75;}
     .model-item-nonchat:hover{opacity:1;}
     .task-hint{font-size:10px;color:var(--muted);font-weight:normal;}
 
-    .usage-bar{padding:5px 20px;border-bottom:1px solid var(--border);background:var(--bg);
-               display:flex;align-items:center;gap:12px;flex-shrink:0;
-               font-family:var(--mono);font-size:11px;}
-    .usage-label{color:var(--muted);white-space:nowrap;}
-    .usage-track{flex:1;height:4px;background:var(--surface2);border-radius:99px;
-                 overflow:hidden;min-width:60px;max-width:180px;}
-    .usage-fill{height:100%;border-radius:99px;background:var(--accent2);
-                transition:width .6s ease,background .3s;}
-    .usage-fill.warn{background:var(--accent);} .usage-fill.danger{background:var(--danger);}
-    .usage-nums{color:var(--text);white-space:nowrap;}
-    .usage-nums .hi{color:var(--accent);}
-    .usage-detail{color:var(--muted);font-size:10px;white-space:nowrap;flex:1;}
-    .usage-status{font-size:10px;padding:1px 7px;border-radius:99px;
-                  border:1px solid var(--border);color:var(--muted);}
-    .usage-status.ok{border-color:var(--success);color:var(--success);}
-    .usage-status.err{border-color:var(--danger);color:var(--danger);}
-    .usage-refresh{background:none;border:none;color:var(--muted);cursor:pointer;
-                   font-size:14px;padding:0 2px;transition:color .2s,transform .3s;}
-    .usage-refresh:hover{color:var(--accent);}
-    .usage-refresh.spinning{animation:spin .6s linear infinite;}
     @keyframes spin{to{transform:rotate(360deg);}}
 
-    #messages{flex:1;min-height:0;overflow-y:auto;padding:20px 0;display:flex;
+    #messages{flex:1;min-height:0;overflow-y:auto;overflow-x:hidden;padding:20px 0;display:flex;
               flex-direction:column;gap:2px;
               scrollbar-width:thin;scrollbar-color:var(--border) transparent;}
-    .msg-wrap{display:flex;padding:0 20px;animation:fadeUp .22s ease both;}
+    .msg-wrap{display:flex;padding:0 20px;animation:fadeUp .22s ease both;min-width:0;}
     @keyframes fadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
     .msg-wrap.user{justify-content:flex-end;}
     .bubble{max-width:72%;padding:11px 15px;border-radius:var(--radius);
-            font-size:14px;line-height:1.7;word-break:break-word;}
-    .bubble.user{background:var(--accent);color:#0d0f14;border-bottom-right-radius:3px;}
+            font-size:14px;line-height:1.7;word-break:break-word;
+            overflow-wrap:break-word;min-width:0;box-sizing:border-box;}
+    .bubble.user{background:var(--accent);color:#0d0f14;border-bottom-right-radius:3px;
+                 min-width:0;box-sizing:border-box;}
+    /* 用户纯文本：保留换行，强制折行，不溢出 */
+    .bubble.user .user-text{
+      white-space:pre-wrap;
+      overflow-wrap:break-word;
+      word-break:break-word;
+      max-width:100%;
+    }
+    /* 折叠信息栏 */
+    .collapse-meta{display:flex;align-items:center;gap:8px;margin-top:6px;
+                   padding-top:6px;border-top:1px solid rgba(0,0,0,.15);}
+    .collapse-len{font-size:11px;opacity:.6;font-family:var(--mono);}
+    .collapse-btn{background:rgba(0,0,0,.12);border:none;color:inherit;
+                  border-radius:4px;padding:2px 8px;font-size:11px;
+                  cursor:pointer;font-family:var(--mono);}
+    .collapse-btn:hover{background:rgba(0,0,0,.22);}
+    .bubble.user .user-actions{opacity:0;transition:opacity .15s;}
+    .bubble.user:hover .user-actions{opacity:1;}
+    .bubble.user .bubble-action-btn{color:#0d0f1488;border-color:#0d0f1422;}
+    .bubble.user .bubble-action-btn:hover{color:#0d0f14;background:#0d0f1411;}
+    .bubble.user .bubble-action-btn.copied{color:#0d0f14;}
     .bubble.assistant{background:var(--surface2);border:1px solid var(--border);
                       color:var(--text);border-bottom-left-radius:3px;}
     .bubble pre{background:var(--code-bg);border:1px solid var(--border);border-radius:6px;
@@ -552,7 +577,7 @@ function getHTML() {
     .trans-btn:hover{opacity:.85;} .trans-btn:disabled{opacity:.4;cursor:default;}
 
     #input-area{padding:12px 20px 16px;border-top:1px solid var(--border);
-                background:var(--surface);flex-shrink:0;}
+                background:var(--surface);flex-shrink:0;min-width:0;overflow:hidden;}
     .upload-preview{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;}
     .upload-chip{display:flex;align-items:center;gap:6px;background:var(--surface2);
                  border:1px solid var(--border);border-radius:6px;padding:3px 9px;
@@ -610,6 +635,8 @@ function getHTML() {
                             font-size:12px;padding:4px 10px;outline:none;transition:border-color .2s;}
     .sys-prompt-wrap input:focus{border-color:var(--accent);}
     .sys-prompt-wrap input::placeholder{color:var(--muted);}
+    .max-tokens-sel{flex-shrink:0;background:var(--surface2);border:1px solid var(--border);border-radius:5px;color:var(--muted);font-family:var(--mono);font-size:11px;padding:2px 6px;cursor:pointer;outline:none;height:26px;}
+    .max-tokens-sel:hover,.max-tokens-sel:focus{border-color:var(--accent2);color:var(--accent2);}
     /* marked.js 输出样式 */
     .bubble table{border-collapse:collapse;width:100%;margin:.5em 0;font-size:13px;}
     .bubble th,.bubble td{border:1px solid var(--border);padding:5px 10px;text-align:left;}
@@ -695,6 +722,7 @@ function getHTML() {
       .sys-prompt-wrap{padding:4px 12px;flex-wrap:nowrap;}
       .sys-prompt-wrap label{display:none;}   /* 移动端隐藏 label 省空间 */
       .sys-prompt-wrap input{font-size:12px;padding:3px 8px;}
+      .max-tokens-sel{font-size:11px;padding:1px 4px;height:24px;}
 
       /* model-bar 移动端 */
       .model-bar{padding:5px 12px;flex-wrap:wrap;}
@@ -702,11 +730,6 @@ function getHTML() {
       .model-bar-hint{display:none;}
       .model-dropdown{min-width:0;right:0;}
       .model-item-desc{display:none;}
-
-      /* usage-bar 精简 */
-      .usage-bar{padding:4px 12px;gap:6px;overflow:hidden;}
-      .usage-detail{display:none;}          /* 隐藏详情，节省空间 */
-      .usage-track{min-width:40px;max-width:100px;}
 
       /* 消息气泡更宽 */
       .bubble{max-width:88%;}
@@ -788,6 +811,14 @@ function getHTML() {
 <div class="sys-prompt-wrap" id="sys-prompt-bar">
   <label>System Prompt</label>
   <input type="text" id="sys-prompt-input" placeholder="You are a helpful AI assistant…（留空使用默认）" />
+  <select id="max-tokens-select" class="max-tokens-sel" title="最大输出 Token 数（影响回复长度）">
+    <option value="1024">1K</option>
+    <option value="2048">2K</option>
+    <option value="4096">4K</option>
+    <option value="8192" selected>8K</option>
+    <option value="16384">16K</option>
+    <option value="32768">32K</option>
+  </select>
 </div>
 <div class="model-bar" id="model-bar">
   <label>模型</label>
@@ -811,15 +842,6 @@ function getHTML() {
     <span id="refresh-models-txt">刷新模型</span>
   </button>
   <span class="model-bar-hint">Ctrl+Enter 发送</span>
-</div>
-
-<div class="usage-bar" id="usage-bar">
-  <span class="usage-label">今日额度</span>
-  <div class="usage-track"><div class="usage-fill" id="usage-fill" style="width:0%"></div></div>
-  <span class="usage-nums"><span id="usage-used">—</span> / <span class="hi">10,000</span> Neurons</span>
-  <span class="usage-detail" id="usage-detail"></span>
-  <span class="usage-status" id="usage-status">—</span>
-  <button class="usage-refresh" id="usage-refresh-btn" title="刷新额度">↻</button>
 </div>
 
 <div id="messages">
@@ -879,10 +901,16 @@ function getHTML() {
         <input type="file" id="file-input" accept="image/*,video/*,.txt,.md,.js,.mjs,.ts,.tsx,.jsx,.py,.ipynb,.java,.c,.cpp,.h,.cs,.go,.rs,.rb,.php,.swift,.kt,.dart,.sh,.bash,.zsh,.ps1,.bat,.html,.css,.scss,.less,.json,.json5,.yaml,.yml,.toml,.xml,.csv,.tsv,.sql,.graphql,.proto,.env,.conf,.ini,.log,.pdf,.docx,.xlsx,.pptx,.md,.rst,.tex" />
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
       </label>
+      <!-- 发送时变为停止按钮（AbortController 中断 SSE） -->
       <button class="icon-btn send" id="send-btn" title="发送 (Ctrl+Enter)">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+        <svg id="send-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+        <svg id="stop-icon" viewBox="0 0 24 24" fill="currentColor" style="display:none;width:14px;height:14px"><rect x="5" y="5" width="14" height="14" rx="2"/></svg>
       </button>
     </div>
+  </div>
+  <!-- 输入框底部工具栏 -->
+  <div id="input-footer" style="display:flex;justify-content:flex-end;align-items:center;padding:2px 2px 0;min-height:16px;">
+    <span id="char-count" style="display:none;font-size:11px;font-family:var(--mono);transition:color .2s;"></span>
   </div>
 </div>
 </div>
@@ -914,10 +942,23 @@ async function doLogin() {
   }
 }
 
-function showApp() {
+async function showApp() {
   document.getElementById('login-page').style.display = 'none';
   document.getElementById('app').style.display = 'flex';
-  fetchUsage();
+  // 从 KV 云端加载历史（如果本地为空时）
+  try {
+    if (!chatHistory.length) {
+      const r = await fetch('/api/history', { headers: authHeaders() });
+      if (r.ok) {
+        const { history, kv } = await r.json();
+        if (kv && Array.isArray(history) && history.length > 0) {
+          chatHistory.splice(0, chatHistory.length, ...history);
+          try { localStorage.setItem('cf_history', JSON.stringify(chatHistory)); } catch {}
+          restoreHistory();
+        }
+      }
+    }
+  } catch {}
 }
 
 function doLogout() {
@@ -936,7 +977,7 @@ document.getElementById('pwd-input').addEventListener('keydown', e => {
 // 有 token 立即乐观显示 app，后台静默验证，仅 401 才强制退回登录
 if (authToken) {
   showApp();
-  fetch('/api/usage', { headers: { 'Authorization': 'Bearer ' + authToken } })
+  fetch('/api/history', { headers: { 'Authorization': 'Bearer ' + authToken } })
     .then(r => { if (r.status === 401) doLogout(); })
     .catch(() => {});
 }
@@ -945,49 +986,42 @@ function authHeaders() {
   return { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + authToken };
 }
 
-// ══ USAGE (真实查询) ════════════════════════════════════════
-const DAILY_LIMIT = 10000;
 
-async function fetchUsage() {
-  const btn    = document.getElementById('usage-refresh-btn');
-  const status = document.getElementById('usage-status');
-  btn.classList.add('spinning');
-  status.textContent = '查询中…'; status.className = 'usage-status';
-  try {
-    const res  = await fetch('/api/usage', { headers: { 'Authorization': 'Bearer ' + authToken } });
-    const data = await res.json();
-    if (!data.configured) {
-      status.textContent = '未配置'; status.className = 'usage-status err';
-      document.getElementById('usage-detail').textContent = '请配置 CF_ACCOUNT_ID 和 CF_API_TOKEN';
-      return;
-    }
-    if (data.error) {
-      status.textContent = '查询失败'; status.className = 'usage-status err';
-      document.getElementById('usage-detail').textContent = data.error;
-      return;
-    }
-    const u    = data.usage;
-    const used = u.neurons_used ?? u.total_neurons ?? u.neurons ?? 0;
-    const pct  = Math.min(100, (used / DAILY_LIMIT) * 100).toFixed(1);
-    const fill = document.getElementById('usage-fill');
-    fill.style.width = pct + '%';
-    fill.className = 'usage-fill' + (pct >= 90 ? ' danger' : pct >= 70 ? ' warn' : '');
-    document.getElementById('usage-used').textContent = used.toLocaleString();
-    status.textContent = '实时'; status.className = 'usage-status ok';
-    const extras = [];
-    if (u.requests)      extras.push(u.requests + ' 次请求');
-    if (u.input_tokens)  extras.push('↑' + u.input_tokens.toLocaleString());
-    if (u.output_tokens) extras.push('↓' + u.output_tokens.toLocaleString());
-    document.getElementById('usage-detail').textContent = extras.join(' · ');
-  } catch (e) {
-    status.textContent = '错误'; status.className = 'usage-status err';
-  } finally {
-    btn.classList.remove('spinning');
-  }
-}
 
 // ══ MODE ═══════════════════════════════════════════════════
 let mode = 'chat', uploadedFiles = [], streaming = false;
+let _abortCtrl = null;   // 当前 SSE 请求的 AbortController
+
+// showToast：轻提示
+function showToast(msg, dur) {
+  let t = document.getElementById('__toast__');
+  if (!t) {
+    t = document.createElement('div'); t.id = '__toast__';
+    t.style.cssText = 'position:fixed;bottom:80px;left:50%;transform:translateX(-50%);' +
+      'background:rgba(0,0,0,.82);color:#fff;padding:7px 18px;border-radius:20px;' +
+      'font-size:13px;z-index:9999;pointer-events:none;transition:opacity .3s;white-space:nowrap;';
+    document.body.appendChild(t);
+  }
+  t.textContent = msg; t.style.opacity = '1';
+  clearTimeout(t._tid);
+  t._tid = setTimeout(() => { t.style.opacity = '0'; }, dur || 2500);
+}
+
+// setSendBtn：切换 发送 ↔ 停止 按钮状态
+function setSendBtn(isStopping) {
+  const btn = document.getElementById('send-btn');
+  const si  = document.getElementById('send-icon');
+  const st  = document.getElementById('stop-icon');
+  if (!btn) return;
+  if (isStopping) {
+    btn.title = '停止生成'; btn.disabled = false;
+    btn.style.cssText = 'background:var(--danger);border-color:var(--danger);';
+    if (si) si.style.display = 'none'; if (st) st.style.display = '';
+  } else {
+    btn.title = '发送 (Ctrl+Enter)'; btn.style.cssText = '';
+    if (si) si.style.display = ''; if (st) st.style.display = 'none';
+  }
+}
 
 // 从 localStorage 恢复对话历史（跨会话持久化）
 let chatHistory = (() => {
@@ -996,6 +1030,14 @@ let chatHistory = (() => {
 function saveHistory() {
   try { localStorage.setItem('cf_history', JSON.stringify(chatHistory.slice(-60))); } catch {}
   saveCurrentSession();
+  // 同时写 KV 云端（异步，不阻塞 UI）
+  if (authToken) {
+    fetch('/api/history', {
+      method: 'POST',
+      headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ history: chatHistory.slice(-60) })
+    }).catch(() => {});
+  }
 }
 function clearHistory() {
   chatHistory = []; localStorage.removeItem('cf_history');
@@ -1018,7 +1060,7 @@ function setMode(m) {
   mode = m;
   document.querySelectorAll('.mode-tab').forEach(t => t.classList.toggle('active', t.dataset.mode === m));
   const isT = m === 'translate';
-  ['messages','input-area','model-bar','usage-bar','sys-prompt-bar'].forEach(id =>
+  ['messages','input-area','model-bar','sys-prompt-bar'].forEach(id =>
     document.getElementById(id).style.display = isT ? 'none' : '');
   document.getElementById('translate-panel').style.display = isT ? 'flex' : 'none';
   document.getElementById('user-input').placeholder = '输入消息…（Ctrl+Enter 发送）';
@@ -1026,8 +1068,65 @@ function setMode(m) {
 
 // ══ TEXTAREA ═══════════════════════════════════════════════
 const ta = document.getElementById('user-input');
-ta.addEventListener('input', () => { ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight,160)+'px'; });
+// 大文本粘贴防卡死：仅在内容 <=2000 字时做自动高度（否则固定最大高度）
+// 防抖：16ms 节流，避免每个字符都触发 scrollHeight 重排
+let _taTimer = null;
+function resizeTA() {
+  if (ta.value.length > 2000) {
+    ta.style.height = '160px';
+    return;
+  }
+  ta.style.height = 'auto';
+  ta.style.height = Math.min(ta.scrollHeight, 160) + 'px';
+}
+ta.addEventListener('input', () => {
+  clearTimeout(_taTimer);
+  // 超长文本（输入法粘贴后）用更长的防抖避免卡死
+  const delay = ta.value.length > 5000 ? 200 : 16;
+  _taTimer = setTimeout(resizeTA, delay);
+  updateCharCount(ta.value.length);
+});
+// 输入法完成（compositionend）：捕获输入法粘贴事件
+ta.addEventListener('compositionend', () => {
+  clearTimeout(_taTimer);
+  _taTimer = setTimeout(resizeTA, 200);
+  updateCharCount(ta.value.length);
+  // 超过 10 万字给出警告
+  if (ta.value.length > 100000) {
+    showToast('⚠️ 内容已超过 10 万字，建议通过上传文件功能传入大文本', 4000);
+  }
+});
+ta.addEventListener('paste', (e) => {
+  // 粘贴时先检查剪贴板大小，超过 50K 字符给出警告
+  const pasted = e.clipboardData?.getData('text') || '';
+  if (pasted.length > 50000) {
+    e.preventDefault();
+    const truncated = pasted.slice(0, 50000);
+    const start = ta.selectionStart, end = ta.selectionEnd;
+    const val = ta.value;
+    ta.value = val.slice(0, start) + truncated + val.slice(end);
+    ta.selectionStart = ta.selectionEnd = start + truncated.length;
+    updateCharCount(ta.value.length);
+    resizeTA();
+    showToast('⚠️ 内容超过 5 万字，已截断至 50,000 字符');
+    return;
+  }
+  setTimeout(() => { resizeTA(); updateCharCount(ta.value.length); }, 0);
+});
 ta.addEventListener('keydown', e => { if (e.key==='Enter'&&(e.ctrlKey||e.metaKey)){e.preventDefault();sendMessage();} });
+
+// 字数统计显示
+function updateCharCount(len) {
+  let el = document.getElementById('char-count');
+  if (!el) return;
+  if (len > 500) {
+    el.textContent = len.toLocaleString() + ' 字';
+    el.style.display = 'inline';
+    el.style.color = len > 20000 ? 'var(--danger)' : len > 5000 ? 'var(--accent)' : 'var(--muted)';
+  } else {
+    el.style.display = 'none';
+  }
+}
 
 // ══ FILE UPLOAD ════════════════════════════════════════════
 document.getElementById('file-input').addEventListener('change', async e => {
@@ -1050,7 +1149,20 @@ function renderPrev() {
 function removeFile(i) { uploadedFiles.splice(i,1); renderPrev(); }
 
 // ══ SEND ═══════════════════════════════════════════════════
+// quickSend：快捷短语直接发送
 function quickSend(t) { document.getElementById('user-input').value=t; sendMessage(); }
+
+async function runChat(text, files) {
+  if (streaming) return;
+  let content = text;
+  files.filter(f => !f.isImage && f.text).forEach(f => {
+    content += '\\n\\n[\\u6587\\u4ef6:' + f.name + ']\\n\`\`\`\\n' + f.text + '\\n\`\`\`';
+  });
+  appendBubble('user', text, files.filter(f => f.isImage).map(f => f.dataUrl));
+  chatHistory.push({ role: 'user', content });
+  saveHistory();
+  await streamChat(0);
+}
 
 async function sendMessage() {
   if (streaming) return;
@@ -1058,52 +1170,129 @@ async function sendMessage() {
   const text  = input.value.trim();
   const files = [...uploadedFiles];
   if (!text && !files.length) return;
-  input.value=''; input.style.height='auto';
+  input.value=''; input.style.height='auto'; updateCharCount(0);
   uploadedFiles=[]; renderPrev();
   document.getElementById('empty-state').style.display='none';
   await runChat(text, files);
 }
 
-// ══ CHAT ═══════════════════════════════════════════════════
-async function runChat(text, files) {
-  streaming = true; document.getElementById('send-btn').disabled = true;
-  let content = text + files.filter(f=>!f.isImage&&f.text)
-    .map(f=>\`\\n\\n【文件:\${f.name}】\\n\\\`\\\`\\\`\\n\${f.text}\\n\\\`\\\`\\\`\`).join('');
-  appendBubble('user', text, files.filter(f=>f.isImage).map(f=>f.dataUrl));
-  chatHistory.push({ role:'user', content });
-  const { textEl } = appendBubble('assistant','', []);
-  const cursor = Object.assign(document.createElement('span'),{className:'cursor-blink'});
-  textEl.appendChild(cursor);
-  const model = document.getElementById('model-select').value;
+// ══ CHAT（SSE 流式模式）══════════════════════════════════════
+async function streamChat(retryCount) {
+  retryCount = retryCount || 0;
+  streaming  = true;
+  _abortCtrl = new AbortController();
+  setSendBtn(true);  // 切换为停止按钮
+
+  const model     = document.getElementById('model-select').value;
+  const sysPrompt = document.getElementById('sys-prompt-input').value.trim();
+  const maxTok    = parseInt(document.getElementById('max-tokens-select')?.value || '8192');
+
+  const { el: wrapEl, textEl } = appendBubble('assistant', '', []);
+  const cursor = document.createElement('span');
+  cursor.className = 'cursor-blink';
+
+  // 显示等待动画
+  textEl.innerHTML = '<span class="thinking-dots"><span></span><span></span><span></span></span>';
+
   try {
-    const sysPrompt = document.getElementById('sys-prompt-input').value.trim();
-    const res = await fetch('/', { method:'POST', headers:authHeaders(),
-      body: JSON.stringify({ messages:chatHistory, model, system: sysPrompt || undefined }) });
-    if (res.status===401) { doLogout(); return; }
-    const reader=res.body.getReader(), dec=new TextDecoder();
-    let full='', buf='';
-    while (true) {
-      const {done,value} = await reader.read(); if (done) break;
-      buf += dec.decode(value,{stream:true});
-      const lines = buf.split('\\n'); buf = lines.pop();
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue;
-        const d = line.slice(6).trim();
-        if (d==='[DONE]') { buf=''; break; }
+    const res = await fetch('/', {
+      method: 'POST',
+      headers: authHeaders(),
+      signal: _abortCtrl?.signal,
+      body: JSON.stringify({
+        messages:   chatHistory,
+        model:      model,
+        system:     sysPrompt || undefined,
+        max_tokens: maxTok
+      })
+    });
+    if (res.status === 401) { doLogout(); return; }
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+
+    // ── 直接读 SSE 流式响应 ────────────────────────────────
+    if (!res.headers.get('content-type')?.includes('text/event-stream')) {
+      // 非 SSE（通常是错误 JSON）
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'HTTP ' + res.status);
+    }
+
+    textEl.innerHTML = ''; textEl.appendChild(cursor);
+    const reader2 = res.body.getReader(), dec2 = new TextDecoder();
+    let full2 = '', buf2 = '';
+    // 真正 token 级别流式：每次 read() 收到 chunk 立刻处理
+    outer: while (true) {
+      const { done, value } = await reader2.read();
+      if (done) break;
+      buf2 += dec2.decode(value, { stream: true });
+      // 逐行处理（SSE 每行以真实换行符结束）
+      let nlIdx;
+      while ((nlIdx = buf2.indexOf('\\n')) !== -1) {
+        const line = buf2.slice(0, nlIdx).trimEnd();
+        buf2 = buf2.slice(nlIdx + 1);
+        if (!line.startsWith('data:')) continue;
+        const d = line.slice(5).trim();
+        if (d === '[DONE]') break outer;
         try {
           const j = JSON.parse(d);
           const tok = j.choices?.[0]?.delta?.content ?? j.response ?? '';
-          if (tok) { full+=tok; cursor.remove(); textEl.innerHTML=renderMD(full); textEl.appendChild(cursor); scrollBot(); }
+          if (tok) {
+            full2 += tok;
+            cursor.remove();
+            // 流式阶段用 textContent（极快，无 Markdown 解析开销）
+            textEl.textContent = full2;
+            textEl.appendChild(cursor);
+            scrollBot();
+          }
         } catch {}
       }
     }
-    cursor.remove(); textEl.innerHTML=renderMD(full); addCodeCopyBtns(textEl);
-    chatHistory.push({role:'assistant',content:full}); saveHistory();
-  } catch(e) {
-    cursor.remove(); textEl.innerHTML=\`<span style="color:var(--danger)">请求失败: \${e.message}</span>\`;
+    reader2.cancel().catch(() => {});
+    // 完成后做一次完整 Markdown 渲染
+    cursor.remove();
+    textEl.innerHTML = renderMD(full2); addCodeCopyBtns(textEl);
+    if (full2) {
+      chatHistory.push({ role: 'assistant', content: full2 });
+      saveHistory();  // saveHistory 同时写 KV
+    }
+    scrollBot(); streaming = false; _abortCtrl = null; setSendBtn(false);
+
+  } catch (e) {
+    // AbortError / BodyStreamBuffer：用户主动停止，静默处理
+    const isAbort = e.name === 'AbortError' || /aborted|abort/i.test(e.message);
+    if (isAbort) {
+      cursor.remove();
+      // 保存已生成内容
+      const partial = textEl.innerText.trim();
+      if (partial) { textEl.innerHTML = renderMD(partial); addCodeCopyBtns(textEl); }
+      else { wrapEl.remove(); }
+      streaming = false; _abortCtrl = null; setSendBtn(false);
+      scrollBot();
+      return;
+    }
+    const isNet = /fetch|network|Failed to fetch/i.test(e.message);
+    if (isNet && retryCount < 3) {
+      wrapEl.remove();
+      streaming = false; _abortCtrl = null; setSendBtn(false);
+      await new Promise(r => setTimeout(r, (retryCount + 1) * 1000));
+      await streamChat(retryCount + 1);
+      return;
+    }
+    textEl.innerHTML =
+      '<div style="color:var(--danger);font-size:13px">' +
+        (isNet ? '\ud83d\udcf6 \u7f51\u7edc\u4e2d\u65ad' : '\u8bf7\u6c42\u5931\u8d25') +
+        ': ' + e.message + '</div>' +
+      '<button id="retry-btn-' + retryCount + '" style="margin-top:8px;padding:4px 14px;' +
+        'border-radius:6px;border:1px solid var(--border);background:transparent;' +
+        'color:var(--accent2);cursor:pointer;font-size:12px">\u21ba \u70b9\u51fb\u91cd\u8bd5</button>';
+    document.getElementById('retry-btn-' + retryCount)?.addEventListener('click', () => {
+      wrapEl.remove(); streaming = false; document.getElementById('send-btn').disabled = false;
+      streamChat(0);
+    });
+    streaming = false; _abortCtrl = null; setSendBtn(false);
   }
-  scrollBot(); streaming=false; document.getElementById('send-btn').disabled=false;
+  scrollBot();
 }
+
 
 // ══ TRANSLATE ══════════════════════════════════════════════
 let transHistory = (() => {
@@ -1184,21 +1373,83 @@ function addCodeCopyBtns(container) {
   });
 }
 
+// COLLAPSE_THRESHOLD: 用户气泡超过此字符数则折叠显示
+const COLLAPSE_THRESHOLD = 600;
+
 function appendBubble(role, text, imgs) {
   const msgs = document.getElementById('messages');
   const wrap = document.createElement('div'); wrap.className = \`msg-wrap \${role}\`;
   const bub  = document.createElement('div'); bub.className  = \`bubble \${role}\`;
   (imgs || []).forEach(u => { const i = document.createElement('img'); i.src = u; i.className = 'preview'; bub.appendChild(i); });
   const el = document.createElement('div');
-  if (text) { el.innerHTML = renderMD(text); addCodeCopyBtns(el); }
-  bub.appendChild(el);
-  // 助手气泡加操作按钮栏
+
+  if (role === 'user' && text) {
+    // 用户消息：纯文本显示（不走 renderMD，避免万字文本生成巨型 HTML）
+    el.className = 'user-text';
+    const needCollapse = text.length > COLLAPSE_THRESHOLD;
+    const displayText  = needCollapse ? text.slice(0, COLLAPSE_THRESHOLD) : text;
+    el.textContent = displayText;
+    if (needCollapse) {
+      const ellipsis = document.createElement('span');
+      ellipsis.textContent = ' …';
+      el.appendChild(ellipsis);
+      const meta = document.createElement('div');
+      meta.className = 'collapse-meta';
+      const lenSpan = document.createElement('span');
+      lenSpan.className = 'collapse-len';
+      lenSpan.textContent = text.length.toLocaleString() + ' 字';
+      const colBtn = document.createElement('button');
+      colBtn.className = 'collapse-btn';
+      colBtn.textContent = '展开全文';
+      meta.appendChild(lenSpan);
+      meta.appendChild(colBtn);
+      let expanded = false;
+      colBtn.addEventListener('click', () => {
+        expanded = !expanded;
+        if (expanded) {
+          el.textContent = text;
+          colBtn.textContent = '收起';
+          lenSpan.textContent = text.length.toLocaleString() + ' 字';
+        } else {
+          el.textContent = displayText;
+          el.appendChild(ellipsis);
+          colBtn.textContent = '展开全文';
+        }
+      });
+      bub.appendChild(el);
+      bub.appendChild(meta);
+    } else {
+      bub.appendChild(el);
+    }
+  } else {
+    // 助手消息：走 Markdown 渲染
+    if (text) { el.innerHTML = renderMD(text); addCodeCopyBtns(el); }
+    bub.appendChild(el);
+  }
+  // 添加操作按钮（user / assistant 各自不同）
+  const copyIcon = \`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>\`;
+
+  if (role === 'user') {
+    // user 气泡：仅复制按钮，悬停才显示
+    const actions = document.createElement('div');
+    actions.className = 'bubble-actions user-actions';
+    actions.innerHTML = \`<button class="bubble-action-btn" title="复制消息">\${copyIcon} 复制</button>\`;
+    actions.querySelector('button').addEventListener('click', function() {
+      const raw = text || el.innerText;
+      navigator.clipboard.writeText(raw).then(() => {
+        this.innerHTML = copyIcon + ' 已复制'; this.classList.add('copied');
+        setTimeout(() => { this.innerHTML = copyIcon + ' 复制'; this.classList.remove('copied'); }, 1500);
+      }).catch(() => {});
+    });
+    bub.appendChild(actions);
+  }
+
   if (role === 'assistant') {
     const actions = document.createElement('div');
     actions.className = 'bubble-actions';
     actions.innerHTML =
       \`<button class="bubble-action-btn" data-action="copy" title="复制全文">
-         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg> 复制
+         \${copyIcon} 复制
        </button>
        <button class="bubble-action-btn" data-action="retry" title="重新生成">
          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 .49-4.95"/></svg> 重新生成
@@ -1210,14 +1461,7 @@ function appendBubble(role, text, imgs) {
       }).catch(() => {});
     });
     actions.querySelector('[data-action="retry"]').addEventListener('click', () => {
-      if (streaming) return;
-      // 移除最后一条 assistant 消息，重新生成
-      if (chatHistory.length && chatHistory[chatHistory.length-1].role === 'assistant') {
-        chatHistory.pop(); saveHistory();
-      }
-      wrap.remove();
-      const lastUser = chatHistory[chatHistory.length-1];
-      if (lastUser) runChat(lastUser.content, []);
+      regenLast(wrap);
     });
     bub.appendChild(actions);
   }
@@ -1395,6 +1639,56 @@ async function refreshModels() {
 })();
 
 // ══ MODEL PICKER ══════════════════════════════════════════
+// ── 每个模型的 max_tokens 上限（基于 CF 文档 context window）──────
+// 原则：max_tokens = min(context_window * 0.5, 16384) 取合理最大输出
+const MODEL_MAX_TOKENS = {
+  // Context: 24K → output max 12K
+  "@cf/meta/llama-3.3-70b-instruct-fp8-fast":         12288,
+  "@cf/meta/llama-4-scout-17b-16e-instruct":           12288,
+  // Context: 128K → output max 16K
+  "@cf/zai-org/glm-4.7-flash":                         16384,
+  "@cf/mistral/mistral-small-3.1-24b-instruct":        16384,
+  "@cf/google/gemma-3-12b-it":                         16384,
+  "@cf/qwen/qwq-32b":                                  16384,
+  "@cf/qwen/qwen3-30b-a3b-fp8":                        16384,
+  // Context: 32K → output max 16K
+  "@cf/mistral/mistral-7b-instruct-v0.2":              16384,
+  "@cf/mistral/mistral-7b-instruct-v0.2-lora":         16384,
+  "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b":      16384,
+  // Context: 8K → output max 4K
+  "@cf/openai/gpt-oss-120b":                            8192,
+  "@cf/openai/gpt-oss-20b":                             8192,
+  "@cf/qwen/qwen2.5-coder-32b-instruct":                8192,
+  "@cf/ibm/granite-4.0-h-micro":                        8192,
+  "@cf/meta/llama-3.1-70b-instruct":                    8192,
+  "@cf/meta/llama-3.1-8b-instruct":                     8192,
+  "@cf/meta/llama-3.1-8b-instruct-fast":                8192,
+  "@cf/meta/llama-3.1-8b-instruct-fp8":                 8192,
+  "@cf/meta/llama-3.1-8b-instruct-awq":                 8192,
+  "@cf/meta/llama-3.2-11b-vision-instruct":             8192,
+  "@cf/meta/llama-3.2-3b-instruct":                     8192,
+  "@cf/meta/llama-3.2-1b-instruct":                     4096,
+  "@cf/meta/llama-3-8b-instruct":                       8192,
+  "@cf/meta-llama/meta-llama-3-8b-instruct":            8192,
+  "@cf/meta/llama-3-8b-instruct-awq":                   8192,
+  "@cf/meta/llama-guard-3-8b":                          4096,
+  "@cf/google/gemma-7b-it":                             8192,
+  "@cf/google/gemma-7b-it-lora":                        8192,
+  "@cf/google/gemma-2b-it-lora":                        4096,
+  "@cf/nousresearch/hermes-2-pro-mistral-7b":           8192,
+  "@cf/aisingapore/gemma-sea-lion-v4-27b-it":           8192,
+  "@cf/mistral/mistral-7b-instruct-v0.1":               4096,
+  "@cf/meta/llama-2-7b-chat-fp16":                      4096,
+  "@cf/meta/llama-2-7b-chat-int8":                      4096,
+  "@cf/meta-llama/llama-2-7b-chat-hf-lora":             4096,
+  "@cf/defog/sqlcoder-7b-2":                            4096,
+  "@cf/microsoft/phi-2":                                4096,
+};
+// getMaxTokens：根据 CF 文档 context window，返回每个模型允许的最大输出 token 数
+function getMaxTokens(modelId) {
+  return MODEL_MAX_TOKENS[modelId] || 8192;
+}
+
 const MODEL_LIST = [
   // ══ 💬 Text Generation ════════════════════════════════════
   // ── 📌 置顶推荐 ──
@@ -1608,12 +1902,35 @@ function initModelPicker() {
     const m = MODEL_LIST.find(x => x.id === id) || MODEL_LIST[0];
     hiddenInput.value    = m.id;
     selectedModel        = m.id;
-    triggerName.textContent = m.name;
+    // 任务类型徽标
+    const BADGES = {'text-gen':'💬','text-to-image':'🖼️','tts':'🔊','asr':'🎤',
+      'embedding':'🔢','classification':'🔤','translation':'🌐',
+      'image-to-text':'📸','object-detect':'🔍','image-classify':'🔍',
+      'summarization':'📝','vad':'🎙️'};
+    const badge = BADGES[m.task] || '🤖';
+    triggerName.textContent = badge + ' ' + m.name;
     triggerTags.innerHTML   = renderTags(m.tags);
     localStorage.setItem('cf_model', m.id);
     listEl.querySelectorAll('.model-item').forEach(el => {
       el.classList.toggle('selected', el.dataset.id === m.id);
     });
+    // 非对话类模型：input placeholder 提示
+    const inp = document.getElementById('user-input');
+    if (inp) {
+      inp.placeholder = (m.task && m.task !== 'text-gen')
+        ? '⚠️ 当前选择的是 ' + badge + ' ' + m.name + '（非对话模型）'
+        : '输入消息…（Ctrl+Enter 发送）';
+    }
+    // 自动将 max-tokens-select 设为该模型允许的最大值
+    const maxSel = document.getElementById('max-tokens-select');
+    if (maxSel) {
+      const limit = getMaxTokens(m.id);
+      let best = maxSel.options[0];
+      for (let i = 0; i < maxSel.options.length; i++) {
+        if (parseInt(maxSel.options[i].value) <= limit) best = maxSel.options[i];
+      }
+      maxSel.value = best.value;
+    }
   }
 
   function renderList(filter) {
@@ -1715,9 +2032,6 @@ document.addEventListener('DOMContentLoaded', () => {
   // 退出
   document.getElementById('logout-btn').addEventListener('click', doLogout);
 
-  // 额度刷新
-  document.getElementById('usage-refresh-btn').addEventListener('click', fetchUsage);
-
   // 快捷提示（利用 data-msg 属性）
   document.querySelectorAll('.suggestion').forEach(el => {
     el.addEventListener('click', () => quickSend(el.dataset.msg));
@@ -1728,7 +2042,26 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('trans-btn').addEventListener('click', doTranslate);
 
   // 发送按钮
-  document.getElementById('send-btn').addEventListener('click', sendMessage);
+  document.getElementById('send-btn').addEventListener('click', () => {
+    if (streaming && _abortCtrl) {
+      // 停止生成：中止当前 SSE 请求
+      _abortCtrl.abort();
+      streaming = false; _abortCtrl = null; setSendBtn(false);
+      // 保存已生成的部分内容（取最后一个 assistant bubble 的文本）
+      const msgs = document.getElementById('messages');
+      const lastBub = msgs.querySelector('.msg-wrap.assistant:last-child .bubble > div');
+      if (lastBub) {
+        const partial = lastBub.innerText.trim();
+        if (partial && partial !== 'AI 思考中…') {
+          chatHistory.push({ role: 'assistant', content: partial });
+          saveHistory();
+        }
+      }
+      showToast('✋ 已停止生成');
+    } else {
+      sendMessage();
+    }
+  });
 
   // upload-preview 事件委托（动态生成的删除按钮）
   document.getElementById('upload-preview').addEventListener('click', e => {
